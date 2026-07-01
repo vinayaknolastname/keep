@@ -21,19 +21,21 @@ import {
   useIncidentAlerts,
   usePollIncidentAlerts,
 } from "utils/hooks/useIncidents";
-import React, { useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { IncidentDto, useIncidentActions } from "@/entities/incidents/model";
 import {
   EmptyStateCard,
   getCommonPinningStylesAndClassNames,
+  showErrorToast,
 } from "@/shared/ui";
-import { useRouter } from "next/navigation";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { TablePagination } from "@/shared/ui";
 import clsx from "clsx";
 import { IncidentAlertsTableBodySkeleton } from "./incident-alert-table-body-skeleton";
 import { IncidentAlertsActions } from "./incident-alert-actions";
 import { AlertSidebar } from "@/features/alerts/alert-detail-sidebar";
 import { ViewAlertModal } from "@/features/alerts/view-raw-alert";
+import { EnrichAlertSidePanel } from "@/features/alerts/enrich-alert";
 import { IncidentAlertActionTray } from "./incident-alert-action-tray";
 import { BellAlertIcon } from "@heroicons/react/24/outline";
 import { AlertsTableBody } from "@/widgets/alerts-table/ui/alerts-table-body";
@@ -98,16 +100,80 @@ export default function IncidentAlerts({ incident }: Props) {
   }, [alerts, pagination]);
   usePollIncidentAlerts(incident.id);
 
-  // State for ViewAlertModal (opened by view button)
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
+  const router = useRouter();
+
+  // State for ViewAlertModal (opened by view button or URL param)
   const [viewAlertModal, setViewAlertModal] = useState<AlertDto | null>(null);
-  
+  const [viewEnrichAlertModal, setEnrichAlertModal] = useState<AlertDto | null>(
+    null
+  );
+  const [isEnrichSidebarOpen, setIsEnrichSidebarOpen] = useState(false);
+
   // State for AlertSidebar (opened by row click)
   const [selectedAlert, setSelectedAlert] = useState<AlertDto | null>(null);
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const [rowSelection, setRowSelection] = useState<RowSelectionState>({});
-  
+
   // Add state for incident selector modal (needed by AlertSidebar)
   const [isIncidentSelectorOpen, setIsIncidentSelectorOpen] = useState(false);
+
+  const resolvedFingerprintRef = useRef<string | null>(null);
+
+  const resetUrlAfterModal = useCallback(() => {
+    const currentParams = new URLSearchParams(searchParams?.toString() ?? "");
+    Array.from(currentParams.keys()).forEach((paramKey) =>
+      currentParams.delete(paramKey)
+    );
+    const url = currentParams.toString()
+      ? `${pathname}?${currentParams.toString()}`
+      : pathname;
+
+    router.replace(url);
+  }, [router, pathname, searchParams]);
+
+  useEffect(() => {
+    const fingerprint = searchParams?.get("alertPayloadFingerprint");
+    const enrich = searchParams?.get("enrich");
+
+    if (fingerprint !== resolvedFingerprintRef.current) {
+      resolvedFingerprintRef.current = null;
+    }
+
+    const dataSettled =
+      alerts && !isLoading && ((alerts.items?.length ?? 0) > 0 || alerts.count === 0);
+
+    if (fingerprint && enrich && dataSettled) {
+      const alert = alerts.items?.find(
+        (item) => item.fingerprint === fingerprint
+      );
+      if (alert) {
+        resolvedFingerprintRef.current = fingerprint;
+        setEnrichAlertModal(alert);
+        setIsEnrichSidebarOpen(true);
+      } else if (!resolvedFingerprintRef.current) {
+        showErrorToast(null, "Alert fingerprint not found");
+        resetUrlAfterModal();
+      }
+    } else if (fingerprint && dataSettled) {
+      const alert = alerts.items?.find(
+        (item) => item.fingerprint === fingerprint
+      );
+      if (alert) {
+        resolvedFingerprintRef.current = fingerprint;
+        setViewAlertModal(alert);
+      } else if (!resolvedFingerprintRef.current) {
+        showErrorToast(null, "Alert fingerprint not found");
+        resetUrlAfterModal();
+      }
+    } else if (alerts && !isLoading && !fingerprint) {
+      resolvedFingerprintRef.current = null;
+      setViewAlertModal(null);
+      setEnrichAlertModal(null);
+      setIsEnrichSidebarOpen(false);
+    }
+  }, [searchParams, alerts, isLoading, resetUrlAfterModal]);
 
   const extraColumns = [
     columnHelper.accessor("is_created_by_ai", {
@@ -193,8 +259,6 @@ export default function IncidentAlerts({ incident }: Props) {
     getCoreRowModel: getCoreRowModel(),
     manualPagination: true,
   });
-
-  const router = useRouter();
 
   if (!isLoading && (alerts?.items ?? []).length === 0) {
     return (
@@ -354,7 +418,20 @@ export default function IncidentAlerts({ incident }: Props) {
       {/* ViewAlertModal - opened by the view button in the action tray */}
       <ViewAlertModal
         alert={viewAlertModal}
-        handleClose={() => setViewAlertModal(null)}
+        handleClose={() => {
+          setViewAlertModal(null);
+          resetUrlAfterModal();
+        }}
+        mutate={() => mutateAlerts()}
+      />
+
+      <EnrichAlertSidePanel
+        alert={viewEnrichAlertModal}
+        isOpen={isEnrichSidebarOpen}
+        handleClose={() => {
+          setIsEnrichSidebarOpen(false);
+          resetUrlAfterModal();
+        }}
         mutate={() => mutateAlerts()}
       />
 

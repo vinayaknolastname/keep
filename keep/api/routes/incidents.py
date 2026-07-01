@@ -1068,6 +1068,17 @@ async def enrich_incident(
     if not incident:
         raise HTTPException(status_code=404, detail="Incident not found")
 
+    logger.info(
+        "Manual incident enrichment API request",
+        extra={
+            "tenant_id": tenant_id,
+            "incident_id": str(incident_id),
+            "user": authenticated_entity.email,
+            "enrichments": enrichment.enrichments,
+            "force": enrichment.force,
+        },
+    )
+
     # Use the existing enrichment infrastructure
     enrichment_bl = EnrichmentsBl(tenant_id, db_session)
 

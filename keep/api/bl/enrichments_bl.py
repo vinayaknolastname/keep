@@ -748,6 +748,19 @@ class EnrichmentsBl:
             "enriching alert db",
             extra={"fingerprint": fingerprint, "tenant_id": self.tenant_id},
         )
+        if action_type == ActionType.INCIDENT_ENRICH:
+            self.logger.info(
+                "EnrichmentsBl incident enrichment",
+                extra={
+                    "tenant_id": self.tenant_id,
+                    "incident_id": str(fingerprint),
+                    "enrichments": enrichments,
+                    "action_callee": action_callee,
+                    "action_description": action_description,
+                    "force": force,
+                    "dispose_on_new_alert": dispose_on_new_alert,
+                },
+            )
         # if these enrichments are disposable, manipulate them with a timestamp
         #   so they can be disposed of later
         if dispose_on_new_alert:

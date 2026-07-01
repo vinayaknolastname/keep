@@ -28,7 +28,15 @@ from keep.api.models.db.alert import Incident
 from keep.api.models.db.rule import Rule
 from keep.api.models.incident import IncidentDto
 from keep.api.utils.cel_utils import preprocess_cel_expression
+from keep.api.consts import KEEP_STORE_RAW_ALERTS
 from keep.api.utils.enrichment_helpers import convert_db_alerts_to_dto_alerts
+from keep.rulesengine.raw_enrichment_helpers import (
+    _match_raw_alert_item,
+    extract_raw_enrichments,
+    get_raw_payload_from_alert,
+    resolve_template_variable,
+    serialize_for_log,
+)
 
 # Shahar: this is performance enhancment https://github.com/cloud-custodian/cel-python/issues/68
 
@@ -226,25 +234,128 @@ class RulesEngine:
 
     def get_value_from_event(self, event: AlertDto, var: str) -> str:
         """
-        Extract value from event based on template variable
-        e.g., alert.labels.host -> event['labels']['host']
-            alert.service -> event['service']
-        """
-        # Remove 'alert.' prefix
-        path = var.replace("alert.", "").split(".")
+        Extract value from event based on template variable.
 
-        current = event.dict()  # Convert to dict for easier access
-        try:
-            for part in path:
-                part = part.strip()
-                current = current.get(part)
-            return str(current) if current is not None else "N/A"
-        except (KeyError, AttributeError):
-            return "N/A"
+        Normalized alert paths: alert.labels.host
+        Raw webhook paths (KEEP_STORE_RAW_ALERTS): raw.alerts[0].condition
+        Unprefixed paths fall back to raw when not found on AlertDto.
+        """
+        resolved = resolve_template_variable(
+            event, var, store_raw_alerts=KEEP_STORE_RAW_ALERTS
+        )
+        return resolved if resolved is not None else "N/A"
 
     def get_vaiables(self, incident_name_template):
         regex = r"\{\{\s*([^}]+)\s*\}\}"
         return re.findall(regex, incident_name_template)
+
+    def _render_incident_enrichments(self, rule: Rule, event: AlertDto) -> dict:
+        incident_enrichments = rule.incident_enrichments or {}
+        if not isinstance(incident_enrichments, dict):
+            self.logger.warning(
+                "Incident enrichments should be a dictionary",
+                extra={"rule_id": rule.id, "rule_name": rule.name},
+            )
+            return {}
+
+        self.logger.info(
+            "Rendering correlation incident enrichments",
+            extra={
+                "rule_id": rule.id,
+                "rule_name": rule.name,
+                "alert_id": event.id,
+                "alert_fingerprint": event.fingerprint,
+                "alert_name": event.name,
+                "keep_store_raw_alerts": KEEP_STORE_RAW_ALERTS,
+                "user_enrichment_templates": incident_enrichments,
+                "normalized_alert": serialize_for_log(event.dict()),
+            },
+        )
+
+        rendered_enrichments = {}
+        raw_auto_enrichments = {}
+
+        if KEEP_STORE_RAW_ALERTS:
+            raw_payload = get_raw_payload_from_alert(event)
+            matched_raw_alert = (
+                _match_raw_alert_item(raw_payload, event) if raw_payload else None
+            )
+            raw_auto_enrichments = extract_raw_enrichments(raw_payload, event)
+            rendered_enrichments.update(raw_auto_enrichments)
+
+            self.logger.info(
+                "Correlation enrichment raw alert context",
+                extra={
+                    "rule_id": rule.id,
+                    "rule_name": rule.name,
+                    "alert_fingerprint": event.fingerprint,
+                    "has_raw_payload": raw_payload is not None,
+                    "raw_payload": serialize_for_log(raw_payload),
+                    "matched_raw_alert_item": serialize_for_log(matched_raw_alert),
+                    "raw_auto_enrichments": raw_auto_enrichments,
+                },
+            )
+        else:
+            self.logger.info(
+                "Skipping raw alert enrichment (KEEP_STORE_RAW_ALERTS disabled)",
+                extra={
+                    "rule_id": rule.id,
+                    "rule_name": rule.name,
+                    "alert_fingerprint": event.fingerprint,
+                },
+            )
+
+        template_resolutions = []
+        for key, value in incident_enrichments.items():
+            if not key:
+                continue
+            if not isinstance(value, str):
+                rendered_enrichments[key] = value
+                template_resolutions.append(
+                    {
+                        "enrichment_key": key,
+                        "template": value,
+                        "resolved_value": value,
+                        "variables": [],
+                    }
+                )
+                continue
+
+            rendered_value = copy.copy(value)
+            variable_resolutions = []
+            for var in self.get_vaiables(value):
+                resolved = self.get_value_from_event(event, var)
+                variable_resolutions.append({"variable": var, "resolved": resolved})
+                pattern = r"\{\{\s*" + re.escape(var) + r"\s*\}\}"
+                rendered_value = re.sub(pattern, resolved, rendered_value)
+            rendered_enrichments[key] = rendered_value
+            template_resolutions.append(
+                {
+                    "enrichment_key": key,
+                    "template": value,
+                    "resolved_value": rendered_value,
+                    "variables": variable_resolutions,
+                }
+            )
+
+        overridden_raw_keys = sorted(
+            key for key in raw_auto_enrichments if key in incident_enrichments
+        )
+
+        self.logger.info(
+            "Correlation incident enrichments rendered",
+            extra={
+                "rule_id": rule.id,
+                "rule_name": rule.name,
+                "alert_fingerprint": event.fingerprint,
+                "raw_auto_enrichments": raw_auto_enrichments,
+                "user_template_resolutions": template_resolutions,
+                "user_overridden_raw_keys": overridden_raw_keys,
+                "final_enrichments": rendered_enrichments,
+            },
+        )
+
+        return rendered_enrichments
 
     def _get_or_create_incident(
         self, rule: Rule, rule_fingerprint, session, event, creation_allowed=True
@@ -346,6 +457,17 @@ class RulesEngine:
                     else f"{rule_fingerprint} - {incident_name}"
                 )
 
+            incident_enrichments = self._render_incident_enrichments(rule, event)
+            self.logger.info(
+                "Creating correlation incident with enrichments",
+                extra={
+                    "rule_id": rule.id,
+                    "rule_name": rule.name,
+                    "alert_fingerprint": event.fingerprint,
+                    "rule_fingerprint": rule_fingerprint,
+                    "incident_enrichments": incident_enrichments,
+                },
+            )
             incident = create_incident_for_grouping_rule(
                 tenant_id=self.tenant_id,
                 rule=rule,
@@ -354,7 +476,19 @@ class RulesEngine:
                 incident_name=incident_name,
                 past_incident=existed_incident,
                 assignee=rule.assignee,
+                enrichments=incident_enrichments,
             )
+            if incident:
+                self.logger.info(
+                    "Correlation incident created with enrichments",
+                    extra={
+                        "rule_id": rule.id,
+                        "rule_name": rule.name,
+                        "incident_id": incident.id,
+                        "alert_fingerprint": event.fingerprint,
+                        "incident_enrichments": incident_enrichments,
+                    },
+                )
             return incident, True
         return None, False
 

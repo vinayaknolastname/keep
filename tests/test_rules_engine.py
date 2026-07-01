@@ -16,7 +16,7 @@ from keep.api.core.db import get_rules as get_rules_db
 from keep.api.core.db import set_last_alert
 from keep.api.core.dependencies import SINGLE_TENANT_UUID
 from keep.api.models.alert import AlertDto, AlertSeverity, AlertStatus
-from keep.api.models.db.alert import Alert, Incident
+from keep.api.models.db.alert import Alert, AlertEnrichment, Incident
 from keep.api.models.db.incident import IncidentSeverity, IncidentStatus
 from keep.api.models.db.rule import CreateIncidentOn, ResolveOn
 from keep.api.utils.enrichment_helpers import convert_db_alerts_to_dto_alerts
@@ -125,6 +125,265 @@ def test_sanity_2(db_session):
     results = rules_engine.run_rules(alerts, session=db_session)
     # check that there are results
     assert len(results) > 0
+
+
+def test_correlation_rule_adds_incident_enrichments(db_session):
+    alerts = [
+        AlertDto(
+            id="sentry-1",
+            source=["sentry"],
+            name="checkout-error",
+            status=AlertStatus.FIRING,
+            severity=AlertSeverity.CRITICAL,
+            lastReceived=datetime.datetime.now().isoformat(),
+            labels={"owner": "payments"},
+        ),
+    ]
+    rules_engine = RulesEngine(tenant_id=SINGLE_TENANT_UUID)
+    create_rule_db(
+        tenant_id=SINGLE_TENANT_UUID,
+        name="test-rule",
+        definition={
+            "sql": "N/A",
+            "params": {},
+        },
+        timeframe=600,
+        timeunit="seconds",
+        definition_cel='(source == "sentry" && labels.owner == "payments")',
+        created_by="test@keephq.dev",
+        incident_enrichments={
+            "owner": "{{ alert.labels.owner }}",
+            "priority": "p1",
+        },
+    )
+
+    alert = Alert(
+        tenant_id=SINGLE_TENANT_UUID,
+        provider_type="test",
+        provider_id="test",
+        event=alerts[0].dict(),
+        fingerprint=alerts[0].fingerprint,
+    )
+    db_session.add(alert)
+    db_session.commit()
+    set_last_alert(SINGLE_TENANT_UUID, alert, db_session)
+
+    alerts[0].event_id = alert.id
+    results = rules_engine.run_rules(alerts, session=db_session)
+
+    assert len(results) > 0
+    incident = db_session.query(Incident).first()
+    enrichment = (
+        db_session.query(AlertEnrichment)
+        .filter(AlertEnrichment.alert_fingerprint == str(incident.id))
+        .first()
+    )
+    assert enrichment.enrichments["owner"] == "payments"
+    assert enrichment.enrichments["priority"] == "p1"
+
+
+def test_extract_raw_enrichments_from_grafana_payload():
+    from keep.rulesengine.raw_enrichment_helpers import extract_raw_enrichments
+
+    alert = AlertDto(
+        id="grafana-1",
+        source=["grafana"],
+        name="HighMemoryConsumption",
+        status=AlertStatus.FIRING,
+        severity=AlertSeverity.WARNING,
+        lastReceived=datetime.datetime.now().isoformat(),
+        fingerprint="53dc66106145ad2adcba9a9d49b20559",
+    )
+    raw_payload = {
+        "title": "HighMemoryConsumption",
+        "status": "firing",
+        "alerts": [
+            {
+                "condition": "B",
+                "fingerprint": "53dc66106145ad2adcba9a9d49b20559",
+                "labels": {"severity": "warning", "monitor": "server1"},
+                "annotations": {"summary": "Memory Usage High on srv1-eu1-prod"},
+            }
+        ],
+    }
+
+    enrichments = extract_raw_enrichments(raw_payload, alert)
+
+    assert enrichments["condition"] == "B"
+    assert enrichments["monitor"] == "server1"
+    assert enrichments["severity"] == "warning"
+    assert enrichments["summary"] == "Memory Usage High on srv1-eu1-prod"
+    assert enrichments["raw_title"] == "HighMemoryConsumption"
+
+
+def test_resolve_template_variable_from_raw_payload():
+    from keep.rulesengine.raw_enrichment_helpers import resolve_template_variable
+
+    alert = AlertDto(
+        id="grafana-1",
+        source=["grafana"],
+        name="HighMemoryConsumption",
+        status=AlertStatus.FIRING,
+        severity=AlertSeverity.WARNING,
+        lastReceived=datetime.datetime.now().isoformat(),
+        fingerprint="53dc66106145ad2adcba9a9d49b20559",
+        labels={"owner": "payments"},
+    )
+    alert.keep_raw_payload = {
+        "title": "HighMemoryConsumption",
+        "alerts": [
+            {
+                "condition": "B",
+                "fingerprint": "53dc66106145ad2adcba9a9d49b20559",
+                "labels": {"monitor": "server1"},
+            }
+        ],
+    }
+
+    assert (
+        resolve_template_variable(
+            alert, "alerts[0].condition", store_raw_alerts=True
+        )
+        == "B"
+    )
+    assert (
+        resolve_template_variable(
+            alert, "raw.alerts[0].labels.monitor", store_raw_alerts=True
+        )
+        == "server1"
+    )
+    assert (
+        resolve_template_variable(alert, "alert.labels.owner", store_raw_alerts=True)
+        == "payments"
+    )
+    assert (
+        resolve_template_variable(
+            alert, "alerts[0].condition", store_raw_alerts=False
+        )
+        is None
+    )
+
+
+def test_correlation_rule_resolves_raw_template_paths(db_session, monkeypatch):
+    monkeypatch.setattr("keep.rulesengine.rulesengine.KEEP_STORE_RAW_ALERTS", True)
+
+    alert = AlertDto(
+        id="grafana-1",
+        source=["grafana"],
+        name="HighMemoryConsumption",
+        status=AlertStatus.FIRING,
+        severity=AlertSeverity.WARNING,
+        lastReceived=datetime.datetime.now().isoformat(),
+        fingerprint="53dc66106145ad2adcba9a9d49b20559",
+    )
+    alert.keep_raw_payload = {
+        "title": "HighMemoryConsumption",
+        "alerts": [{"condition": "B", "fingerprint": "53dc66106145ad2adcba9a9d49b20559"}],
+    }
+
+    rules_engine = RulesEngine(tenant_id=SINGLE_TENANT_UUID)
+    create_rule_db(
+        tenant_id=SINGLE_TENANT_UUID,
+        name="test-rule",
+        definition={"sql": "N/A", "params": {}},
+        timeframe=600,
+        timeunit="seconds",
+        definition_cel='(source == "grafana")',
+        created_by="test@keephq.dev",
+        incident_enrichments={
+            "condition": "{{ alerts[0].condition }}",
+        },
+    )
+
+    db_alert = Alert(
+        tenant_id=SINGLE_TENANT_UUID,
+        provider_type="grafana",
+        provider_id="test",
+        event=alert.dict(),
+        fingerprint=alert.fingerprint,
+    )
+    db_session.add(db_alert)
+    db_session.commit()
+    set_last_alert(SINGLE_TENANT_UUID, db_alert, db_session)
+
+    alert.event_id = db_alert.id
+    results = rules_engine.run_rules([alert], session=db_session)
+
+    assert len(results) > 0
+    incident = db_session.query(Incident).first()
+    enrichment = (
+        db_session.query(AlertEnrichment)
+        .filter(AlertEnrichment.alert_fingerprint == str(incident.id))
+        .first()
+    )
+    assert enrichment.enrichments["condition"] == "B"
+
+
+def test_correlation_rule_merges_raw_and_user_incident_enrichments(db_session, monkeypatch):
+    monkeypatch.setattr("keep.rulesengine.rulesengine.KEEP_STORE_RAW_ALERTS", True)
+
+    alert = AlertDto(
+        id="grafana-1",
+        source=["grafana"],
+        name="HighMemoryConsumption",
+        status=AlertStatus.FIRING,
+        severity=AlertSeverity.WARNING,
+        lastReceived=datetime.datetime.now().isoformat(),
+        fingerprint="53dc66106145ad2adcba9a9d49b20559",
+        labels={"owner": "payments"},
+    )
+    alert.keep_raw_payload = {
+        "title": "HighMemoryConsumption",
+        "alerts": [
+            {
+                "condition": "B",
+                "fingerprint": "53dc66106145ad2adcba9a9d49b20559",
+                "labels": {"monitor": "server1"},
+            }
+        ],
+    }
+
+    rules_engine = RulesEngine(tenant_id=SINGLE_TENANT_UUID)
+    create_rule_db(
+        tenant_id=SINGLE_TENANT_UUID,
+        name="test-rule",
+        definition={"sql": "N/A", "params": {}},
+        timeframe=600,
+        timeunit="seconds",
+        definition_cel='(source == "grafana")',
+        created_by="test@keephq.dev",
+        incident_enrichments={
+            "owner": "{{ alert.labels.owner }}",
+            "priority": "p1",
+        },
+    )
+
+    db_alert = Alert(
+        tenant_id=SINGLE_TENANT_UUID,
+        provider_type="grafana",
+        provider_id="test",
+        event=alert.dict(),
+        fingerprint=alert.fingerprint,
+    )
+    db_session.add(db_alert)
+    db_session.commit()
+    set_last_alert(SINGLE_TENANT_UUID, db_alert, db_session)
+
+    alert.event_id = db_alert.id
+    results = rules_engine.run_rules([alert], session=db_session)
+
+    assert len(results) > 0
+    incident = db_session.query(Incident).first()
+    enrichment = (
+        db_session.query(AlertEnrichment)
+        .filter(AlertEnrichment.alert_fingerprint == str(incident.id))
+        .first()
+    )
+    assert enrichment.enrichments["condition"] == "B"
+    assert enrichment.enrichments["monitor"] == "server1"
+    assert enrichment.enrichments["owner"] == "payments"
+    assert enrichment.enrichments["priority"] == "p1"
+    assert enrichment.enrichments["raw_title"] == "HighMemoryConsumption"
 
 
 def test_sanity_3(db_session):

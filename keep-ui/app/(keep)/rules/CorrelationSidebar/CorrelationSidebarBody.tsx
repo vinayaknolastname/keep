@@ -79,7 +79,19 @@ export const CorrelationSidebarBody = ({
       multiLevelPropertyName,
       threshold,
       assignee,
+      incidentEnrichments,
     } = correlationFormData;
+
+    const incidentEnrichmentsObject = incidentEnrichments.reduce(
+      (acc, enrichment) => {
+        const key = enrichment.key.trim();
+        if (key) {
+          acc[key] = enrichment.value;
+        }
+        return acc;
+      },
+      {} as Record<string, string>
+    );
 
     const body = {
       sqlQuery: formatQuery(query, "parameterized_named"),
@@ -98,6 +110,7 @@ export const CorrelationSidebarBody = ({
       multiLevelPropertyName,
       threshold,
       assignee,
+      incidentEnrichments: incidentEnrichmentsObject,
     };
 
     try {

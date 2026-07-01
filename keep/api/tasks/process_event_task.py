@@ -21,7 +21,16 @@ from keep.api.alert_deduplicator.alert_deduplicator import AlertDeduplicator
 from keep.api.bl.enrichments_bl import EnrichmentsBl
 from keep.api.bl.incidents_bl import IncidentBl
 from keep.api.bl.maintenance_windows_bl import MaintenanceWindowsBl
-from keep.api.consts import KEEP_CORRELATION_ENABLED, MAINTENANCE_WINDOW_ALERT_STRATEGY, fingerprints_for_poll_payload
+from keep.api.consts import (
+    KEEP_CORRELATION_ENABLED,
+    KEEP_STORE_RAW_ALERTS,
+    MAINTENANCE_WINDOW_ALERT_STRATEGY,
+    fingerprints_for_poll_payload,
+)
+from keep.rulesengine.raw_enrichment_helpers import (
+    attach_raw_payloads_to_alerts,
+    serialize_for_log,
+)
 from keep.api.core.db import (
     bulk_upsert_alert_fields,
     enrich_alerts_with_incidents,
@@ -61,7 +70,6 @@ from keep.workflowmanager.workflowmanager import WorkflowManager
 
 TIMES_TO_RETRY_JOB = 5  # the number of times to retry the job in case of failure
 # Opt-outs/ins
-KEEP_STORE_RAW_ALERTS = os.environ.get("KEEP_STORE_RAW_ALERTS", "false") == "true"
 
 KEEP_ALERT_FIELDS_ENABLED = (
     os.environ.get("KEEP_ALERT_FIELDS_ENABLED", "true") == "true"
@@ -554,6 +562,27 @@ def __handle_formatted_events(
                     "tenant_id": tenant_id,
                 },
             )
+
+    if KEEP_STORE_RAW_ALERTS:
+        attach_raw_payloads_to_alerts(raw_events, enriched_formatted_events)
+        logger.info(
+            "Attached raw alert payloads for correlation enrichments",
+            extra={
+                "tenant_id": tenant_id,
+                "provider_type": provider_type,
+                "provider_id": provider_id,
+                "raw_events_count": len(raw_events),
+                "formatted_events_count": len(enriched_formatted_events),
+                "raw_payloads": [
+                    serialize_for_log(raw_event)
+                    for raw_event in raw_events
+                    if isinstance(raw_event, dict)
+                ],
+                "alert_fingerprints": [
+                    alert.fingerprint for alert in enriched_formatted_events
+                ],
+            },
+        )
 
     incidents = []
     with tracer.start_as_current_span("process_event_run_rules_engine"):

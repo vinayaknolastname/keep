@@ -1294,13 +1294,50 @@ def _enrich_entity(
         enrichments (dict): The enrichments to add to the alert.
         force (bool): Whether to force the enrichment to be updated. This is used to dispose enrichments if necessary.
     """
+    is_incident_enrichment = action_type == ActionType.INCIDENT_ENRICH
+    if is_incident_enrichment:
+        logger.info(
+            "Incident enrichment request received",
+            extra={
+                "tenant_id": tenant_id,
+                "incident_id": str(fingerprint),
+                "action_callee": action_callee,
+                "action_description": action_description,
+                "incoming_enrichments": enrichments,
+                "force": force,
+                "audit_enabled": audit_enabled,
+            },
+        )
+
     enrichment = get_enrichment_with_session(session, tenant_id, fingerprint)
     if enrichment:
+        previous_enrichments = enrichment.enrichments or {}
         # if force - override exisitng enrichments. being used to dispose enrichments if necessary
         if force:
             new_enrichment_data = enrichments
         else:
-            new_enrichment_data = {**enrichment.enrichments, **enrichments}
+            new_enrichment_data = {**previous_enrichments, **enrichments}
+        if is_incident_enrichment:
+            logger.info(
+                "Updating existing incident enrichment record",
+                extra={
+                    "tenant_id": tenant_id,
+                    "incident_id": str(fingerprint),
+                    "enrichment_record_id": enrichment.id,
+                    "previous_enrichments": previous_enrichments,
+                    "incoming_enrichments": enrichments,
+                    "merged_enrichments": new_enrichment_data,
+                    "overwritten_keys": sorted(
+                        key
+                        for key in enrichments
+                        if key in previous_enrichments
+                        and previous_enrichments[key] != enrichments[key]
+                    ),
+                    "new_keys": sorted(
+                        key for key in enrichments if key not in previous_enrichments
+                    ),
+                },
+            )
         # SQLAlchemy doesn't support updating JSON fields, so we need to do it manually
         # https://github.com/sqlalchemy/sqlalchemy/discussions/8396#discussion-4308891
         stmt = (
@@ -1322,8 +1359,29 @@ def _enrich_entity(
         session.commit()
         # Refresh the instance to get updated data from the database
         session.refresh(enrichment)
+        if is_incident_enrichment:
+            logger.info(
+                "Incident enrichment saved (update)",
+                extra={
+                    "tenant_id": tenant_id,
+                    "incident_id": str(fingerprint),
+                    "enrichment_record_id": enrichment.id,
+                    "saved_enrichments": enrichment.enrichments,
+                    "action_callee": action_callee,
+                },
+            )
         return enrichment
     else:
+        if is_incident_enrichment:
+            logger.info(
+                "Creating new incident enrichment record",
+                extra={
+                    "tenant_id": tenant_id,
+                    "incident_id": str(fingerprint),
+                    "enrichments": enrichments,
+                    "action_callee": action_callee,
+                },
+            )
         try:
             alert_enrichment = AlertEnrichment(
                 tenant_id=tenant_id,
@@ -1342,6 +1400,17 @@ def _enrich_entity(
                 )
                 session.add(audit)
             session.commit()
+            if is_incident_enrichment:
+                logger.info(
+                    "Incident enrichment saved (create)",
+                    extra={
+                        "tenant_id": tenant_id,
+                        "incident_id": str(fingerprint),
+                        "enrichment_record_id": alert_enrichment.id,
+                        "saved_enrichments": alert_enrichment.enrichments,
+                        "action_callee": action_callee,
+                    },
+                )
             return alert_enrichment
         except IntegrityError:
             # If we hit a duplicate entry error, rollback and get the existing enrichment
@@ -2241,8 +2310,10 @@ def create_rule(
     multi_level_property_name=None,
     threshold=1,
     assignee=None,
+    incident_enrichments=None,
 ):
     grouping_criteria = grouping_criteria or []
+    incident_enrichments = incident_enrichments or {}
     with Session(engine) as session:
         rule = Rule(
             tenant_id=tenant_id,
@@ -2264,6 +2335,7 @@ def create_rule(
             multi_level_property_name=multi_level_property_name,
             threshold=threshold,
             assignee=assignee,
+            incident_enrichments=incident_enrichments,
         )
         session.add(rule)
         session.commit()
@@ -2290,6 +2362,7 @@ def update_rule(
     multi_level_property_name,
     threshold,
     assignee=None,
+    incident_enrichments=None,
 ):
     rule_uuid = __convert_to_uuid(rule_id)
     if not rule_uuid:
@@ -2318,6 +2391,7 @@ def update_rule(
             rule.multi_level_property_name = multi_level_property_name
             rule.threshold = threshold
             rule.assignee = assignee
+            rule.incident_enrichments = incident_enrichments or {}
             session.commit()
             session.refresh(rule)
             return rule
@@ -2418,9 +2492,9 @@ def create_incident_for_grouping_rule(
     incident_name: str = None,
     past_incident: Optional[Incident] = None,
     assignee: str | None = None,
+    enrichments: dict | None = None,
     session: Optional[Session] = None,
 ):
-
     with existed_or_new_session(session) as session:
         # Create and add a new incident if it doesn't exist
         incident = Incident(
@@ -2442,6 +2516,49 @@ def create_incident_for_grouping_rule(
             incident.user_generated_name = f"{rule.incident_prefix}-{incident.running_number} - {incident.user_generated_name}"
         session.commit()
         session.refresh(incident)
+        logger.info(
+            "Correlation incident created",
+            extra={
+                "tenant_id": tenant_id,
+                "incident_id": incident.id,
+                "incident_name": incident.user_generated_name,
+                "rule_id": rule.id,
+                "rule_name": rule.name,
+                "rule_fingerprint": rule_fingerprint,
+                "has_enrichments": bool(enrichments),
+            },
+        )
+        if enrichments:
+            logger.info(
+                "Applying correlation incident enrichments",
+                extra={
+                    "tenant_id": tenant_id,
+                    "incident_id": incident.id,
+                    "rule_id": rule.id,
+                    "rule_name": rule.name,
+                    "rule_fingerprint": rule_fingerprint,
+                    "enrichments": enrichments,
+                },
+            )
+            enrich_entity(
+                tenant_id=tenant_id,
+                fingerprint=incident.id,
+                enrichments=enrichments,
+                action_type=ActionType.INCIDENT_ENRICH,
+                action_callee="correlation-engine",
+                action_description="Incident enriched during correlation",
+                session=session,
+            )
+            logger.info(
+                "Correlation incident enrichments applied",
+                extra={
+                    "tenant_id": tenant_id,
+                    "incident_id": incident.id,
+                    "rule_id": rule.id,
+                    "rule_name": rule.name,
+                    "enrichments": enrichments,
+                },
+            )
     return incident
 
 
