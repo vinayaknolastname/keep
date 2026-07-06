@@ -105,10 +105,12 @@ When `KEEP_STORE_RAW_ALERTS` is **disabled**, correlation rules still create inc
 
 | Scenario | Enrichments |
 |----------|-------------|
-| **New incident** created by the rule | Templates are rendered and saved |
-| **Existing incident** reused (same rule fingerprint) | Not re-run — first alert's enrichments are kept |
+| **New incident** created by the rule | Templates rendered from the **triggering alert** and saved |
+| **Existing incident** reused (same rule fingerprint) | **Not re-run** — enrichments stay from the first alert that created the incident |
 
-Enrichments are resolved from the **triggering alert** at incident creation time, using:
+Enrichments are resolved from the **single alert that triggered incident creation** in that request — not from alerts that are added later.
+
+Data for templates comes from:
 
 1. **Formatted alert** (`alert.*` / top-level fields on `AlertDto`)
 2. **In-memory raw webhook** (`keep_raw_payload` on `AlertDto` during ingestion — not saved on the `alert` row)
